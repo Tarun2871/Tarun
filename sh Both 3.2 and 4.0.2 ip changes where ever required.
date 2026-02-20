@@ -1,0 +1,198 @@
+      
+#!/usr/bin/env bash
+# Update_IP.sh — ConVox IP Updater (colorized ASCII tables + emoji headers)
+# - Single-line Namaste header
+# - Supports ConVox 4.2 & 3.2
+# - Per-table emoji header + per-table color for ASCII table output
+# - Shows SELECT * ... LIMIT 1 preview first (colored)
+# - Ask update (Y/N) -> NEW IP (validated) -> apply -> verification (colored)
+# - Hides raw mysql stderr; prints friendly statuses
+# - Footer with Completed message
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------- Colors & styles ----------------
+BOLD="\e[1m"
+GREEN="\e[32m"
+RED="\e[31m"
+YELLOW="\e[33m"
+CYAN="\e[36m"
+MAGENTA="\e[35m"
+BLUE="\e[34m"
+NC="\e[0m"
+
+# ---------------- Header ----------------
+echo -e "             🙏 Namaste 🙏"
+echo
+
+# ------------ Select ConVox version (clean) ------------
+echo -e "${YELLOW}${BOLD}Select ConVox Version${NC}"
+echo -e "${CYAN} → Enter 42 for ConVox 4.2${NC}"
+echo -e "${CYAN} → Enter 32 for ConVox 3.2${NC}"
+echo
+read -rp $'\033[36;1mEnter your choice (42/32): \033[0m' VER
+
+if [[ "$VER" == "42" ]]; then
+    VERSION="4.2"
+    DB="convoxcces_global"
+    MYSQL_USER="convox4"
+    MYSQL_PASS="ConVox@4"
+    TABLES=(convoxccs_user_details convoxccs_servers convoxccs_web_servers convoxccs_stations)
+    SQL_UPDATES=(
+        "UPDATE convoxccs_user_details SET server_ip='%s';"
+        "UPDATE convoxccs_servers SET server_ip='%s';"
+        "UPDATE convoxccs_servers SET telnet_host='%s';"
+        "UPDATE convoxccs_servers SET remote_telnet_host='%s';"
+        "UPDATE convoxccs_web_servers SET server_ip='%s';"
+        "UPDATE convoxccs_stations SET server_ip='%s';"
+    )
+elif [[ "$VER" == "32" ]]; then
+    VERSION="3.2"
+    DB="convoxccs32"
+    MYSQL_USER="convox32"
+    MYSQL_PASS="convox32"
+    TABLES=(convoxccs_agent_details convoxccs_servers convoxccs_web_servers convoxccs_stations)
+    SQL_UPDATES=(
+        "UPDATE convoxccs_agent_details SET server_ip='%s';"
+        "UPDATE convoxccs_servers SET server_ip='%s';"
+        "UPDATE convoxccs_servers SET telnet_host='%s';"
+        "UPDATE convoxccs_web_servers SET server_ip='%s';"
+        "UPDATE convoxccs_stations SET server_ip='%s';"
+    )
+else
+    echo -e "${RED}${BOLD}Invalid option. Use 42 or 32.${NC}"
+    exit 1
+fi
+
+echo -e "${CYAN}Using DB: ${BOLD}$DB${NC}    ${CYAN}Version: ${BOLD}$VERSION${NC}"
+echo "----------------------------------------"
+
+# ---------- helper: determine emoji + color per table ----------
+table_style() {
+  local t="$1"
+  local ICON="📄"
+  local COLOR="$CYAN"
+  case "$t" in
+    convoxccs_user_details|convoxccs_agent_details)
+        ICON="👤"
+        COLOR="${YELLOW}"  # 🟨 style
+        ;;
+    convoxccs_servers)
+        ICON="🖥️"
+        COLOR="${GREEN}"   # 🟩 style
+        ;;
+    convoxccs_web_servers)
+        ICON="🌐"
+        COLOR="${CYAN}"    # 🟦 style
+        ;;
+    convoxccs_stations)
+        ICON="🎧"
+        COLOR="${MAGENTA}" # 🟪 style
+        ;;
+    *)
+        ICON="📄"
+        COLOR="${CYAN}"
+        ;;
+  esac
+  printf "%b" "${COLOR}${BOLD}${ICON} Table: ${t}${NC}"
+}
+
+# ---------- function: print a table (SELECT ... LIMIT 1) in color ----------
+print_colored_table() {
+  local t="$1"
+  local query="$2"   # query string to run
+  local COLOR
+  # pick color for printing lines (same as table_style mapping)
+  case "$t" in
+    convoxccs_user_details|convoxccs_agent_details) COLOR="${YELLOW}" ;;
+    convoxccs_servers) COLOR="${GREEN}" ;;
+    convoxccs_web_servers) COLOR="${CYAN}" ;;
+    convoxccs_stations) COLOR="${MAGENTA}" ;;
+    *) COLOR="${CYAN}" ;;
+  esac
+
+  TMP_OUT="$(mktemp)"
+  # run mysql and capture stdout (hide stderr)
+  mysql --table -u"$MYSQL_USER" -p"$MYSQL_PASS" "$DB" -e "$query" > "$TMP_OUT" 2>/dev/null || true
+
+  if [[ -s "$TMP_OUT" ]]; then
+    # print each line with color
+    while IFS= read -r line; do
+      echo -e "${COLOR}${line}${NC}"
+    done < "$TMP_OUT"
+  else
+    echo -e "${RED}<unable to read table or no rows>${NC}"
+  fi
+  rm -f "$TMP_OUT"
+}
+
+# ----------- FIRST DISPLAY: show SELECT * LIMIT 1 for each table (colored) -----------
+echo -e "${GREEN}${BOLD}Current Table Preview (SELECT * ... LIMIT 1):${NC}"
+for t in "${TABLES[@]}"; do
+    echo "----------------------------------------"
+    # print emoji header (colored)
+    table_style "$t"
+    echo
+    # print colored ASCII table for LIMIT 1
+    print_colored_table "$t" "SELECT * FROM ${t} LIMIT 1;"
+done
+echo "----------------------------------------"
+
+# ----------- Ask Update Y/N -----------
+read -rp $'\n\033[33;1mDo you want to update NEW IP? (Y/N): \033[0m' ANS
+ANS=${ANS^^}
+
+if [[ "$ANS" != "Y" ]]; then
+    echo -e "${GREEN}${BOLD}No update selected. Exiting.${NC}"
+    exit 0
+fi
+
+# ----------- Ask NEW IP (validate) -----------
+read -rp $'\033[36;1mEnter NEW IP: \033[0m' NEW_IP
+
+if [[ $NEW_IP =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+  for i in 1 2 3 4; do
+    octet="${BASH_REMATCH[$i]}"
+    if (( octet < 0 || octet > 255 )); then
+      echo -e "${RED}${BOLD}Invalid IP: each octet must be 0-255.${NC}"
+      exit 1
+    fi
+  done
+else
+  echo -e "${RED}${BOLD}Invalid IP format.${NC}"
+  exit 1
+fi
+
+echo -e "${GREEN}${BOLD}Updating IP to: ${NEW_IP}${NC}"
+echo "----------------------------------------"
+
+# ----------- APPLY SQL UPDATES (suppress raw mysql stderr) -----------
+for tpl in "${SQL_UPDATES[@]}"; do
+    q=$(printf "$tpl" "$NEW_IP")
+    if mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" "$DB" -e "$q" 2>/dev/null; then
+        echo -e "${CYAN}OK:${NC} ${q}"
+    else
+        echo -e "${YELLOW}Attempted:${NC} ${q} ${RED}(failed - hidden)${NC}"
+    fi
+done
+
+echo -e "${GREEN}${BOLD}✔ IP update attempts complete.${NC}"
+echo "----------------------------------------"
+
+# ----------- SECOND DISPLAY: Verification (colored) -----------
+echo -e "${GREEN}${BOLD}Verification: SELECT * LIMIT 1 from each table:${NC}"
+for t in "${TABLES[@]}"; do
+    echo "----------------------------------------"
+    table_style "$t"
+    echo
+    print_colored_table "$t" "SELECT * FROM ${t} LIMIT 1;"
+done
+
+echo "----------------------------------------"
+echo
+echo -e "${GREEN}${BOLD}✔ Completed Successfully for ConVox ${VERSION}${NC}"
+echo -e "${CYAN}      Copyrights NK${NC}"
+echo "----------------------------------------"
+
+exit 0
