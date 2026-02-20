@@ -1,0 +1,347 @@
+
+#!/usr/bin/env bash
+# ConVox Backup Script (SAFE, CLEAN, TIMERS) - NK Edition
+# Final: colorized, creates temporary Application.zip (outside main folder),
+# includes it in final main ZIP, then removes the temp. No unzip demo included.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Colors
+CYAN=$'\e[0;36m'
+GREEN=$'\e[0;32m'
+YELLOW=$'\e[1;33m'
+RED=$'\e[0;31m'
+MAG=$'\e[0;35m'
+NC=$'\e[0m'
+
+# ---------------- Trishul spinner ----------------
+spinner_pid=0
+spinner_msg=""
+spinner_frames=("🔱" "|" "/" "-" "\\")
+spinner_interval=0.12
+
+spinner_start() {
+  spinner_msg="$1"
+  spinner_stop >/dev/null 2>&1 || true
+  (
+    i=0
+    while :; do
+      frame="${spinner_frames[i]}"
+      printf "\r%s %s" "${CYAN}${frame}${NC}" "${spinner_msg}..."
+      i=$(((i+1) % ${#spinner_frames[@]}))
+      sleep "$spinner_interval"
+    done
+  ) &
+  spinner_pid=$!
+  trap 'spinner_cleanup' EXIT
+}
+
+spinner_stop() {
+  local status="${1:-ok}"
+  if [[ $spinner_pid -ne 0 ]]; then
+    kill "$spinner_pid" >/dev/null 2>&1 || true
+    wait "$spinner_pid" 2>/dev/null || true
+    spinner_pid=0
+    if [[ "$status" == "ok" ]]; then
+      printf "\r%s %s\n" "${GREEN}✔${NC}" "${spinner_msg}"
+    else
+      printf "\r%s %s\n" "${RED}✖${NC}" "${spinner_msg}"
+    fi
+    trap - EXIT
+  fi
+}
+
+spinner_cleanup() {
+  if [[ $spinner_pid -ne 0 ]]; then
+    kill "$spinner_pid" >/dev/null 2>&1 || true
+  fi
+}
+
+# UI helpers
+print_step() { printf "%b\n" "${CYAN}--- ${1} ---${NC}"; }
+print_ok()   { printf "%b %b\n" "${GREEN}✔${NC}" "${1}"; }
+print_warn() { printf "%b %b\n" "${YELLOW}⚠${NC}" "${1}"; }
+print_err()  { printf "%b %b\n" "${RED}✖${NC}" "${1}"; }
+
+# Pretty banner
+echo -e "${GREEN}╔════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║${NC} ${CYAN}                🙏  Namaste  🙏${NC}   ${YELLOW}—                           ${NC} ${GREEN}║${NC}"
+echo -e "${GREEN}╠════════════════════════════════════════════════════════════════╣${NC}"
+printf "%s\n" "${GREEN}║${NC} ${MAG}            🌈 ConVox SAFE BACKUP (Tarun)${NC}                         ${GREEN}║${NC}"
+echo -e "${GREEN}╚════════════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "${CYAN}Note:${NC} This script only reads files and writes into ${GREEN}/root/ConVox_*_Backup_*${NC}"
+echo ""
+
+# Start / timers
+DATE=$(date '+%Y-%m-%d_%H%M%S')
+ROOT="/root"
+TMPDIR="${TMPDIR:-/tmp}"
+START_TIME=$(date +%s)
+
+# Version selection
+print_step "Select ConVox Version"
+echo " → Enter 42 for ConVox 4.2"
+echo " → Enter 32 for ConVox 3.2"
+printf "%b " "${CYAN}Enter your choice (42/32): ${NC}"
+read -r VER_CHOICE
+VER_CHOICE="${VER_CHOICE//[[:space:]]/}"
+
+if [[ "$VER_CHOICE" != "42" && "$VER_CHOICE" != "32" ]]; then
+  print_err "Invalid choice. Please run the script again and enter 42 or 32."
+  exit 1
+fi
+
+if [ "$VER_CHOICE" = "42" ]; then
+  VER_LABEL="4.2"
+else
+  VER_LABEL="3.2"
+fi
+
+printf "%b " "${CYAN}Is the Application backup required? (Y/N): ${NC}"
+read -r APP
+printf "%b " "${CYAN}Is the Database backup required? (Y/N): ${NC}"
+read -r DB
+APP="${APP,,}"
+DB="${DB,,}"
+
+BACKUP_DIR="${ROOT}/ConVox_${VER_LABEL}_Backup_${DATE}"
+mkdir -p "$BACKUP_DIR"
+print_ok "Backup folder: ${BACKUP_DIR}"
+echo ""
+
+# safe_copy: recursive copy of directory or file(s)
+safe_copy() {
+  local src_pattern="$1"
+  local dest_dir="$2"
+
+  if ! compgen -G "$src_pattern" >/dev/null; then
+    print_warn "Not found: ${src_pattern}"
+    return
+  fi
+
+  mkdir -p "$dest_dir"
+
+  for src in $src_pattern; do
+    if [ ! -e "$src" ]; then
+      print_warn "Skipping missing: ${src}"
+      continue
+    fi
+
+    printf "%b Copying: %s -> %s\n" "${CYAN}➡️${NC}" "$src" "$dest_dir"
+    if cp -a -- "$src" "$dest_dir/" 2>/dev/null; then
+      print_ok "Copied: $src"
+    else
+      print_err "Failed to copy: $src"
+    fi
+  done
+}
+
+# format_time
+format_time() {
+  local T=$1
+  printf "%02d:%02d:%02d" "$((T/3600))" "$(((T%3600)/60))" "$((T%60))"
+}
+
+# ---------------- DATABASE BACKUP ----------------
+DB_START=0; DB_END=0
+if [[ "$DB" == "y" ]]; then
+  DB_START=$(date +%s)
+  print_step "Database Backup"
+
+  if [ "$VER_CHOICE" = "42" ]; then
+    DB_USER="convox4"; DB_PASS="ConVox@4"
+    DBS=(convoxcces_global convoxcces_historical convoxcces_lead_mgmt convoxcces_txn_log convoxcces_dnc convoxcces_call_limits)
+  else
+    DB_USER="convox32"; DB_PASS="convox32"
+    # dump log first so folder shows log first per your request
+    DBS=(convoxccs32_log convoxccs32)
+  fi
+
+  for db in "${DBS[@]}"; do
+    SQL="${BACKUP_DIR}/${DATE}_${db}.sql"
+    ZIP="${SQL}.zip"
+
+    spinner_start "Dumping DB: ${db}"
+    if /usr/bin/mysqldump -u"$DB_USER" -p"$DB_PASS" "$db" > "$SQL" 2>/dev/null; then
+      if zip -q -j "$ZIP" "$SQL" 2>/dev/null; then
+        rm -f "$SQL"
+        spinner_stop ok
+        print_ok "DB backup: ${db}"
+      else
+        rm -f "$SQL"
+        spinner_stop fail
+        print_err "Zip failed for DB: ${db}"
+      fi
+    else
+      rm -f "$SQL"
+      spinner_stop fail
+      print_warn "DB not found or dump failed: ${db}"
+    fi
+  done
+
+  DB_END=$(date +%s)
+  echo ""
+fi
+
+# ---------------- APPLICATION BACKUP ----------------
+APP_START=0; APP_END=0
+if [[ "$APP" == "y" ]]; then
+  APP_START=$(date +%s)
+  print_step "Application Backup"
+
+  # capture crontab for current user (read-only)
+  if crontab -l > "${BACKUP_DIR}/crontab.txt" 2>/dev/null; then
+    print_ok "Saved current user's crontab to ${BACKUP_DIR}/crontab.txt"
+  else
+    print_warn "No crontab for current user or failed to read crontab"
+  fi
+
+  spinner_start "Copying application files"
+
+  if [ "$VER_CHOICE" = "42" ]; then
+    safe_copy "/var/www/asterisk"            "${BACKUP_DIR}/var_www"
+    safe_copy "/var/www/convox4.conf"        "${BACKUP_DIR}/var_www"
+    safe_copy "/var/www/convox_agi"          "${BACKUP_DIR}/var_www"
+    safe_copy "/var/www/convox_moh"          "${BACKUP_DIR}/var_www"
+    safe_copy "/var/www/convox_perl"         "${BACKUP_DIR}/var_www"
+    safe_copy "/var/www/convox_sounds"       "${BACKUP_DIR}/var_www"
+    safe_copy "/var/www/convoxwebpanel.conf" "${BACKUP_DIR}/var_www"
+    safe_copy "/var/www/html/ConVox*"        "${BACKUP_DIR}/var_www_html"
+    safe_copy "/var/www/html/*.php"          "${BACKUP_DIR}/var_www_html"
+
+    # remove recordings from backup copy only
+    rm -rf "${BACKUP_DIR}/var_www_html"/ConVox*/Admin/Reports/Recordings* 2>/dev/null || true
+  else
+    safe_copy "/usr/share/convox"             "${BACKUP_DIR}/usr_share"
+    safe_copy "/var/lib/asterisk"             "${BACKUP_DIR}/var_lib"
+    safe_copy "/var/www/html/ConVoxCCS"       "${BACKUP_DIR}/var_www_html"
+    safe_copy "/var/www/html/*.php"           "${BACKUP_DIR}/var_www_html"
+    safe_copy "/etc/convox*"                  "${BACKUP_DIR}/etc"
+    safe_copy "/etc/hosts"                    "${BACKUP_DIR}/etc"
+    safe_copy "/etc/sysconfig/network-scripts" "${BACKUP_DIR}/etc"
+    safe_copy "/etc/asterisk"                 "${BACKUP_DIR}/etc"
+
+    rm -rf "${BACKUP_DIR}/var_www_html"/ConVox*/Admin/Reports/Recordings* 2>/dev/null || true
+  fi
+
+  spinner_stop ok
+
+  # ---------------- CREATE TEMP APPLICATION ZIP (outside main folder) ----------------
+  print_step "Creating temporary Application.zip for final archive"
+  TMP_APP_ZIP="${TMPDIR}/${DATE}_Application.zip"
+  rm -f "$TMP_APP_ZIP"
+  pushd "${BACKUP_DIR}" >/dev/null 2>&1 || true
+  APP_ITEMS=()
+  [[ -d var_www ]]      && APP_ITEMS+=("var_www")
+  [[ -d var_www_html ]] && APP_ITEMS+=("var_www_html")
+  [[ -d etc ]]         && APP_ITEMS+=("etc")
+  [[ -d usr_share ]]   && APP_ITEMS+=("usr_share")
+  [[ -d var_lib ]]     && APP_ITEMS+=("var_lib")
+
+  if [ ${#APP_ITEMS[@]} -gt 0 ]; then
+    (cd "${BACKUP_DIR}" && zip -qr "${TMP_APP_ZIP}" "${APP_ITEMS[@]}") 2>/dev/null || true
+    print_ok "Created temporary Application.zip at ${TMP_APP_ZIP}"
+  else
+    print_warn "No application folders to add to temporary Application.zip"
+  fi
+  popd >/dev/null 2>&1 || true
+
+  APP_END=$(date +%s)
+  echo ""
+fi
+
+# ---------------- CREATE FINAL ZIP (ordered contents) ----------------
+ZIP_START=$(date +%s)
+FINAL_ZIP="${BACKUP_DIR}.zip"
+print_step "Creating final ZIP (ordered contents)"
+
+pushd "$BACKUP_DIR" >/dev/null 2>&1 || true
+ZIP_LIST=()
+shopt -s nullglob
+
+# 1) non-log DB zips first
+for f in ${DATE}_*.sql.zip; do
+  if [[ "$f" == *"_log.sql.zip" ]]; then
+    continue
+  fi
+  ZIP_LIST+=("$f")
+done
+
+# 2) log DB zips
+for f in ${DATE}_*_log.sql.zip; do
+  ZIP_LIST+=("$f")
+done
+
+# 3) if tmp app zip exists, copy it into a temp name inside backup dir for inclusion
+TMP_APP_COPY=""
+if [ -f "${TMP_APP_ZIP:-}" ]; then
+  TMP_APP_COPY="${BACKUP_DIR}/__tmp_app_${DATE}.zip"
+  cp -f "$TMP_APP_ZIP" "$TMP_APP_COPY"
+  ZIP_LIST+=("$(basename "$TMP_APP_COPY")")
+fi
+
+# 4) crontab
+[ -f "crontab.txt" ] && ZIP_LIST+=("crontab.txt")
+
+if [ ${#ZIP_LIST[@]} -gt 0 ]; then
+  (cd "$BACKUP_DIR" && zip -qr "${FINAL_ZIP##*/}" "${ZIP_LIST[@]}") 2>/dev/null || true
+  mv -f "${BACKUP_DIR}/${FINAL_ZIP##*/}" "$FINAL_ZIP" 2>/dev/null || true
+  print_ok "Created final ZIP: ${FINAL_ZIP}"
+else
+  print_warn "Nothing to add to final ZIP"
+fi
+
+# cleanup temporary copy inside backup dir and tmp app zip
+if [ -n "$TMP_APP_COPY" ] && [ -f "$TMP_APP_COPY" ]; then
+  rm -f "$TMP_APP_COPY"
+fi
+if [ -n "${TMP_APP_ZIP:-}" ] && [ -f "$TMP_APP_ZIP" ]; then
+  rm -f "$TMP_APP_ZIP"
+fi
+
+popd >/dev/null 2>&1 || true
+shopt -u nullglob
+ZIP_END=$(date +%s)
+
+# ---------------- Show total size & summary ----------------
+SIZE=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+END_TIME=$(date +%s)
+
+echo ""
+echo -e "${GREEN}===========================================${NC}"
+print_ok "Backup Completed"
+echo -e "${GREEN}Backup Folder:${NC} ${CYAN}${BACKUP_DIR}${NC}"
+echo -e "${GREEN}Backup ZIP   :${NC} ${CYAN}${FINAL_ZIP}${NC}"
+echo -e "${YELLOW}Total Backup Size:${NC} ${CYAN}${SIZE}${NC}"
+echo ""
+echo -e "${CYAN}⏱ TIMING SUMMARY:${NC}"
+
+if [[ "${APP_START:-0}" -ne 0 ]]; then
+  echo -e "Application Backup Time : ${GREEN}$(format_time $((APP_END-APP_START)))${NC}"
+else
+  echo -e "Application Backup Time : ${YELLOW}00:00:00${NC}"
+fi
+
+if [[ "${DB_START:-0}" -ne 0 ]]; then
+  echo -e "Database Backup Time    : ${GREEN}$(format_time $((DB_END-DB_START)))${NC}"
+else
+  echo -e "Database Backup Time    : ${YELLOW}00:00:00${NC}"
+fi
+
+echo -e "ZIP Creation Time       : ${GREEN}$(format_time $((ZIP_END-ZIP_START)))${NC}"
+echo -e "Total Backup Time       : ${GREEN}$(format_time $((END_TIME-START_TIME)))${NC}"
+echo -e "${CYAN}===========================================${NC}"
+echo ""
+
+# top-level summary
+if command -v tree >/dev/null 2>&1; then
+  echo -e "${CYAN}Backup contents (top-level):${NC}"
+  tree -L 2 "$BACKUP_DIR" || true
+else
+  echo -e "${CYAN}Backup contents (top-level):${NC}"
+  find "$BACKUP_DIR" -maxdepth 2 -printf "%P\n" | sed 's|[^/]*|  &|' || true
+fi
+
+exit 0
